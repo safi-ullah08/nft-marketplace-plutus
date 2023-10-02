@@ -31,7 +31,7 @@ import Ledger.Tx.Constraints.OnChain.V2 as Constraints
 import Plutus.V2.Ledger.Contexts as PV2
 import Plutus.Script.Utils.Typed as Scripts
 import Plutus.V2.Ledger.Api 
-import Plutus.Script.Utils.Value (symbols)
+import Plutus.Script.Utils.Value 
 import Ledger.Typed.Scripts (ScriptContextV2)
 import Plutus.Script.Utils.Ada as Ada
 import qualified Plutus.Script.Utils.V2.Typed.Scripts.Validators as V2UtilsTypeScripts
@@ -87,9 +87,10 @@ PlutusTx.makeLift ''MarketplaceParam
 mkValidator :: MarketplaceParam -> MarketplaceDatum -> MarketplaceRedeemer -> PV2.ScriptContext -> Bool
 mkValidator mp dat redeemer ctx = 
   case redeemer of
-    Buy ->    traceIfFalse "Fee is 1 ADA" checkFee &&
-              traceIfFalse "Price mismatch" checkPrice && 
-              traceIfFalse "No NFT attached to utxo" checkInputForNFT
+    Buy ->    traceIfFalse "No NFT attached to utxo" checkInputForNFT &&
+              traceIfFalse "Fee is 10000 lovelace" checkFee &&
+              traceIfFalse "Price mismatch" checkPrice  &&
+              traceIfFalse "Transaction does not have NFT" checkNFTOutput
        
     Cancel -> traceIfFalse "Must be Signed by Seller" signedBySeller
        
@@ -107,11 +108,17 @@ mkValidator mp dat redeemer ctx =
     checkInputForNFT = (nCurrency dat) `elem` getListOfTokensInInput
 
     checkFee :: Bool
-    checkFee = fromInteger (Ada.getLovelace (Ada.fromValue (PV2.valuePaidTo info ( feeCollector mp))))  == (fromInteger $ fee mp) 
+    checkFee = fromInteger (Ada.getLovelace (Ada.fromValue (PV2.valuePaidTo info ( feeCollector mp))))  >= (fromInteger $ fee mp) 
 
     checkPrice :: Bool
-    checkPrice = fromInteger (Ada.getLovelace (Ada.fromValue (PV2.valuePaidTo info (seller dat))))  == (fromInteger $ price dat )
+    checkPrice = fromInteger (Ada.getLovelace (Ada.fromValue (PV2.valuePaidTo info (seller dat))))  >= (fromInteger $ price dat )
 
+    checkNFTOutput :: Bool
+    checkNFTOutput = (valueOf (PV2.valuePaidTo info buyerSig) (nCurrency dat) (nToken dat))  == 1
+
+    buyerSig :: PubKeyHash
+    buyerSig = case PV2.txInfoSignatories info of
+            [pubKeyHash] -> pubKeyHash
 
 
 data MarketplaceData
@@ -121,7 +128,7 @@ instance V2UtilsTypeScripts.ValidatorTypes MarketplaceData where
   type RedeemerType MarketplaceData = MarketplaceRedeemer
 
 typedValidator :: MarketplaceParam -> V2UtilsTypeScripts.TypedValidator MarketplaceData
-typedValidator ep =go (ep) where
+typedValidator mp =go (mp) where
     go = V2UtilsTypeScripts.mkTypedValidatorParam @MarketplaceData
         $$(PlutusTx.compile [|| mkValidator ||])
         $$(PlutusTx.compile [|| wrap ||])

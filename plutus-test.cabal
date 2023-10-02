@@ -75,6 +75,7 @@ library
     build-depends:    
       base ^>=4.14.3.0,
       aeson -any,
+      lens -any,
       bytestring -any,
       containers -any,
       freer-extras -any,
@@ -156,4 +157,14 @@ test-suite plutus-test-test
     -- Test dependencies.
     build-depends:
         base ^>=4.14.3.0,
+        plutus-contract -any,
+        data-default -any,
+        plutus-script-utils,
+        containers,
+        plutus-ledger-api,
+        cardano-api,
+        tasty,
+        tasty-hunit,
+        plutus-ledger,
+        plutus-tx,
         plutus-test

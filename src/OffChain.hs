@@ -31,6 +31,9 @@ import Ledger.Scripts.Orphans ()
 import Data.Map as Map
 import Plutus.Script.Utils.Ada as Ada
 import Control.Monad (void)
+import Control.Lens ((^?))
+import Plutus.V1.Ledger.Api as Api
+
 
 import Ledger.Typed.Scripts as Scripts
 import Plutus.Script.Utils.Value
@@ -57,14 +60,14 @@ type MarketplaceSchema =
    
 
 
-newtype RedeemSuccess = RedeemSuccess TxId
+newtype RedeemSuccess = RedeemSuccess Ledger.TxId
     deriving (Pr.Eq, Pr.Show)
 
 data BuyParams = BuyParams
   { 
-    buyFeeCollector :: PubKeyHash
+    buyFeeCollector :: PaymentPubKeyHash
   , buyFee :: Integer
-  , buySeller     :: PubKeyHash
+  , buySeller     :: PaymentPubKeyHash
   , buyPrice      :: Integer
   , buyCurrencySymbol  :: CurrencySymbol
   , buyTokenName     :: TokenName
@@ -81,10 +84,9 @@ start buyParams = do
   networkId <- pNetworkId <$> getParams
   pkh <- ownPaymentPubKeyHash
   contractPkh <- Contract.ownAddresses
-  ownUtxos <- utxosAt (NE.head contractPkh)
   let mp =
         MarketplaceParam
-          { feeCollector = buyFeeCollector buyParams,
+          { feeCollector = unPaymentPubKeyHash $ buyFeeCollector buyParams,
             fee = buyFee buyParams
           }
       validatorInst = (typedValidator mp)
@@ -98,7 +100,8 @@ start buyParams = do
           }
       
       totalCost =  buyPrice buyParams  + buyFee buyParams
-      tx = Constraints.mustPayToTheScriptWithDatumInTx dat $ Ada.lovelaceValueOf totalCost
+      nftValue = Api.singleton (buyCurrencySymbol buyParams) (buyTokenName buyParams) 1
+      tx = Constraints.mustPayToTheScriptWithDatumInTx dat nftValue
 
 
   logInfo @Pr.String $ "Seller Address PKH " Pr.<> (Pr.show $ pkh)
@@ -116,48 +119,62 @@ buy :: forall w s e. AsContractError e => BuyParams -> Contract w s e ()
 buy buyParams = do
   networkId <- pNetworkId <$> getParams
   pkh <- ownPaymentPubKeyHash
-  contractPkh <- Contract.ownAddresses
-  ownUtxos <- utxosAt (NE.head contractPkh)
   let mp =
-        MarketplaceParam
-          { feeCollector = buyFeeCollector buyParams,
+         MarketplaceParam
+          { feeCollector = unPaymentPubKeyHash $ buyFeeCollector buyParams,
             fee = buyFee buyParams
           }
       validatorInst = (typedValidator mp)
       addr = Scripts.validatorCardanoAddress networkId validatorInst
   let dat =
         MarketplaceDatum
-          { seller = unPaymentPubKeyHash $ pkh,
+          { seller = unPaymentPubKeyHash $ buySeller buyParams,
             price = buyPrice buyParams,
             nCurrency = buyCurrencySymbol buyParams,
             nToken = buyTokenName buyParams
           }
       
-      totalCost =  buyPrice buyParams  + buyFee buyParams
-      tx = Constraints.mustPayToTheScriptWithDatumInTx dat $ Ada.lovelaceValueOf totalCost
+      rMarketplace =  Buy
+
+  ownUtxos <- utxosAt (addr)
+  selectedUtxos <- Map.filter (findSale dat ) <$>  utxosAt (addr)
+  logInfo @Pr.String $ "Selected UTXOs " Pr.<> (Pr.show $ selectedUtxos)
+  logInfo @Pr.String $ "Selected UTXOs " Pr.<> (Pr.show $ ownUtxos)
 
 
-  logInfo @Pr.String $ "Seller Address PKH " Pr.<> (Pr.show $ pkh)
-  logInfo @Pr.String $ "Price set by seller " Pr.<> (Pr.show $ buySeller buyParams)
-  logInfo @Pr.String $ "Fee Collector Address " Pr.<> (Pr.show $ buyFeeCollector buyParams)
-  logInfo @Pr.String $ "Fee for the protocol " Pr.<> (Pr.show $ buyFee buyParams)
 
-  void $ mkTxConstraints (Constraints.typedValidatorLookups (typedValidator mp)) tx
-         >>= Contract.adjustUnbalancedTx >>= Contract.submitUnbalancedTx
+  if Map.null selectedUtxos
+    then logInfo @Pr.String $ "no such utxo"
+    else do
+      let orefs = fst <$> Map.toList selectedUtxos
+        
+          oref = Pr.head orefs
+          constraints = [ Constraints.mustSpendOutputFromTheScript oref rMarketplace
+                        , Constraints.mustBeSignedBy pkh
+                        , Constraints.mustPayToPubKey (buySeller buyParams) (Ada.lovelaceValueOf (price dat))
+                        , Constraints.mustPayToPubKey (buyFeeCollector buyParams) (Ada.lovelaceValueOf (fee mp))
+                   ]
+          tx = mconcat constraints
+      
+      utx <- mkTxConstraints ( Constraints.typedValidatorLookups (typedValidator mp)
+                              Pr.<> Constraints.unspentOutputs selectedUtxos
+                               ) tx >>= Contract.adjustUnbalancedTx
+              
+      RedeemSuccess . getCardanoTxId  <$> submitUnbalancedTx utx
+      logInfo @Pr.String $ "collected payment"
 
 cancel :: forall w s e. AsContractError e => BuyParams -> Contract w s e ()
 cancel buyParams = do
   networkId <- pNetworkId <$> getParams
   pkh <- ownPaymentPubKeyHash
-  contractPkh <- Contract.ownAddresses
-  ownUtxos <- utxosAt (NE.head contractPkh)
   let mp =
-        MarketplaceParam
-          { feeCollector = buyFeeCollector buyParams,
+         MarketplaceParam
+          { feeCollector = unPaymentPubKeyHash $ buyFeeCollector buyParams,
             fee = buyFee buyParams
           }
       validatorInst = (typedValidator mp)
       addr = Scripts.validatorCardanoAddress networkId validatorInst
+      ownUtxos = utxosAt (addr)
   let dat =
         MarketplaceDatum
           { seller = unPaymentPubKeyHash $ pkh,
@@ -166,17 +183,44 @@ cancel buyParams = do
             nToken = buyTokenName buyParams
           }
       
-      totalCost =  buyPrice buyParams  + buyFee buyParams
-      tx = Constraints.mustPayToTheScriptWithDatumInTx dat $ Ada.lovelaceValueOf totalCost
+      rMarketplace =  Cancel
+
+  selectedUtxos <- Map.filter (findSale dat ) <$> ownUtxos
+
+  logInfo @Pr.String $ "Selected UTXOs " Pr.<> (Pr.show $ selectedUtxos)
 
 
-  logInfo @Pr.String $ "Seller Address PKH " Pr.<> (Pr.show $ pkh)
-  logInfo @Pr.String $ "Price set by seller " Pr.<> (Pr.show $ buySeller buyParams)
-  logInfo @Pr.String $ "Fee Collector Address " Pr.<> (Pr.show $ buyFeeCollector buyParams)
-  logInfo @Pr.String $ "Fee for the protocol " Pr.<> (Pr.show $ buyFee buyParams)
+  if Map.null selectedUtxos
+    then logInfo @Pr.String $ "no such utxo"
+    else do
+      let orefs = fst <$> Map.toList selectedUtxos
+        
+          oref = Pr.head orefs
+          constraints = [ Constraints.mustSpendOutputFromTheScript oref rMarketplace
+                        , Constraints.mustBeSignedBy (buySeller buyParams)
+                    ]
+          tx = mconcat constraints
+      
+      utx <- mkTxConstraints ( Constraints.typedValidatorLookups (typedValidator mp)
+                              Pr.<> Constraints.unspentOutputs selectedUtxos
+                               ) tx >>= Contract.adjustUnbalancedTx
+              
+      RedeemSuccess . getCardanoTxId  <$> submitUnbalancedTx utx
+      logInfo @Pr.String $ "collected payment"
 
-  void $ mkTxConstraints (Constraints.typedValidatorLookups (typedValidator mp)) tx
-         >>= Contract.adjustUnbalancedTx >>= Contract.submitUnbalancedTx
+findSale :: MarketplaceDatum  -> DecoratedTxOut -> Bool
+findSale datum o = case o of
+  ScriptDecoratedTxOut {_decoratedTxOutScriptDatum = (_, datumFromQuery)} -> 
+    case datumFromQuery ^? datumInDatumFromQuery of
+      Nothing -> False
+      Just (Datum e) -> case PlutusTx.fromBuiltinData e of
+        Nothing -> False
+        Just d ->  nCurrency d == nCurrency datum && nToken d == nToken datum
+  PublicKeyDecoratedTxOut {} -> False 
+  _ -> False
+
+
+
 
 
 endpoints :: Contract () MarketplaceSchema Text ()
